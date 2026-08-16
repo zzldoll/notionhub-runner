@@ -29,7 +29,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       NOTIONHUB_API_BASE: https://i.notionhub.app/v1
-      NOTIONHUB_CONFIG_VERSION: '33'
+      NOTIONHUB_CONFIG_VERSION: '39'
       WEREAD_CONFIG: ${{ secrets.WEREAD_CONFIG }}
       PODCAST_CONFIG: ${{ secrets.PODCAST_CONFIG }}
       DOUBAN_CONFIG: ${{ secrets.DOUBAN_CONFIG }}
@@ -47,8 +47,10 @@ jobs:
       SPOTIFY_CONFIG: ${{ secrets.SPOTIFY_CONFIG }}
       TRAKT_CONFIG: ${{ secrets.TRAKT_CONFIG }}
       XIAOHONGSHU_CONFIG: ${{ secrets.XIAOHONGSHU_CONFIG }}
+      DOUYIN_CONFIG: ${{ secrets.DOUYIN_CONFIG }}
       YOUTUBE_CONFIG: ${{ secrets.YOUTUBE_CONFIG }}
       GUWENDAO_CONFIG: ${{ secrets.GUWENDAO_CONFIG }}
+      GHSTAR_CONFIG: ${{ secrets.GHSTAR_CONFIG }}
       DAILY_CONFIG: ${{ secrets.DAILY_CONFIG }}
     steps:
       - name: 验证修复配置
@@ -76,7 +78,7 @@ jobs:
           OIDC_TOKEN=$(curl -fsSL -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https%3A%2F%2Fi.notionhub.app" | jq -r '.value // empty')
           echo "::add-mask::$OIDC_TOKEN"
           AUTH_RESPONSE="$RUNNER_TEMP/notionhub-authorize.json"
-          HTTP_STATUS=$(curl -sS -o "$AUTH_RESPONSE" -w '%{http_code}' -X POST "$NOTIONHUB_API_BASE/github/runner/authorize-run"             -H "Authorization: Bearer $OIDC_TOKEN" -H 'Content-Type: application/json'             --data "{"service":"${{ steps.validate.outputs.service }}","purpose":"fix"}")
+          HTTP_STATUS=$(curl -sS -o "$AUTH_RESPONSE" -w '%{http_code}' -X POST "$NOTIONHUB_API_BASE/github/runner/authorize-run"             -H "Authorization: Bearer $OIDC_TOKEN" -H 'Content-Type: application/json'             --data "{\"service\":\"${{ steps.validate.outputs.service }}\",\"purpose\":\"fix\"}")
           if [ "$HTTP_STATUS" -lt 200 ] || [ "$HTTP_STATUS" -ge 300 ]; then
             MESSAGE=$(jq -r '.message // "修复授权失败"' "$AUTH_RESPONSE")
             echo "::error title=修复授权失败::$MESSAGE"

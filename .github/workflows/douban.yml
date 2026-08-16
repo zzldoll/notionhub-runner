@@ -1,4 +1,4 @@
-# NotionHub generated workflow v37
+# NotionHub generated workflow v38
 name: 豆瓣
 
 on:
@@ -25,6 +25,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
   id-token: write
 
 concurrency:
@@ -42,7 +43,7 @@ jobs:
       DOUBAN_CONFIG: ${{ secrets.DOUBAN_CONFIG }}
       NOTIONHUB_API_BASE: https://i.notionhub.app/v1
       NOTIONHUB_SERVICE: douban
-      NOTIONHUB_CONFIG_VERSION: '33'
+      NOTIONHUB_CONFIG_VERSION: '39'
       SYNC_POLICY_STATE_PATH: ${{ github.workspace }}/notionhub-state.json
       SYNC_POLICY_CONTINUATION_PATH: ${{ github.workspace }}/notionhub-continuation-id
       SYNC_POLICY_REPORT_PATH: ${{ github.workspace }}/notionhub-service-report.json
@@ -226,6 +227,9 @@ jobs:
             echo "NOTIONHUB_INITIAL_FULL_SYNC_FORCED=$INITIAL_FULL_SYNC_FORCED"
           } >> "$GITHUB_ENV"
           export NOTIONHUB_ACTION_PAYLOAD="$ACTION_PAYLOAD"
+          export NOTIONHUB_REQUESTED_SYNC_MODE="$REQUESTED_SYNC_MODE"
+          export NOTIONHUB_EFFECTIVE_SYNC_MODE="$EFFECTIVE_SYNC_MODE"
+          export NOTIONHUB_INITIAL_FULL_SYNC_FORCED="$INITIAL_FULL_SYNC_FORCED"
           python3 - <<'PY'
           import json
           import os
@@ -249,8 +253,8 @@ jobs:
           PLAN=$(printf '%s' "$SERVICE_CONFIG" | jq -r '.DOUBAN_SYNC_PLAN // "lifetime"')
           JOB_ENABLED=true
           SKIP_REASON=""
-          SERVICE_OPTIONS=$(printf '%s' "$SERVICE_CONFIG" | jq -r '.DOUBAN_SERVICE_OPTIONS // "{}"')
-          if ! printf '%s' "$SERVICE_OPTIONS" | jq -e --arg key "movie" 'try fromjson catch {} | (.enabledStreams // []) as $enabled | ($enabled | length == 0) or ($enabled | index($key) != null)' >/dev/null; then
+          SERVICE_OPTIONS=$(printf '%s' "$SERVICE_CONFIG" | jq -c '.DOUBAN_SERVICE_OPTIONS // {}')
+          if ! printf '%s' "$SERVICE_OPTIONS" | jq -e --arg key "movie" '(if type == "string" then (try fromjson catch {}) elif type == "object" then . else {} end) | (.enabledStreams // []) as $enabled | ($enabled | length == 0) or ($enabled | index($key) != null)' >/dev/null; then
             JOB_ENABLED=false
             SKIP_REASON="未在同步内容中启用"
           fi
@@ -274,6 +278,7 @@ jobs:
           if [ -f runner/requirements.txt ]; then pip install --quiet --disable-pip-version-check -r runner/requirements.txt; fi
           SERVICE_REQUIREMENTS=$(cd runner && python -m notionhub_runner requirements douban)
           if [ -f "$SERVICE_REQUIREMENTS" ]; then pip install --quiet --disable-pip-version-check -r "$SERVICE_REQUIREMENTS"; fi
+
 
       - name: 同步电影
         id: sync
@@ -305,6 +310,9 @@ jobs:
             echo "NOTIONHUB_INITIAL_FULL_SYNC_FORCED=$INITIAL_FULL_SYNC_FORCED"
           } >> "$GITHUB_ENV"
           export NOTIONHUB_ACTION_PAYLOAD="$ACTION_PAYLOAD"
+          export NOTIONHUB_REQUESTED_SYNC_MODE="$REQUESTED_SYNC_MODE"
+          export NOTIONHUB_EFFECTIVE_SYNC_MODE="$EFFECTIVE_SYNC_MODE"
+          export NOTIONHUB_INITIAL_FULL_SYNC_FORCED="$INITIAL_FULL_SYNC_FORCED"
           if [ "$SYNC_PLAN" = "trial" ] && [ "$EFFECTIVE_SYNC_MODE" = "full" ]; then
             echo "::error title=免费体验不支持全量更新::请激活后再执行全量更新。"
             exit 1
@@ -332,7 +340,7 @@ jobs:
             STATUS=failure
           fi
           if [ ! -f "$SYNC_POLICY_STATE_PATH" ]; then printf '{}' > "$SYNC_POLICY_STATE_PATH"; fi
-          jq -cn             --arg jobKey "movie"             --arg label "同步电影"             --arg status "$STATUS"             --arg failureClass "${NOTIONHUB_FAILURE_CLASS:-}"             --argjson stageIndex 1             --argjson required true             '{stageIndex:$stageIndex,jobKey:$jobKey,label:$label,status:$status,required:$required,failureClass:(if ($failureClass | length) > 0 then $failureClass else null end)}'             > "${{ github.workspace }}/notionhub-stage-01.json"
+          jq -cn             --arg jobKey "movie"             --arg stageLabel "同步电影"             --arg status "$STATUS"             --arg failureClass "${NOTIONHUB_FAILURE_CLASS:-}"             --argjson stageIndex 1             --argjson required true             '{stageIndex:$stageIndex,jobKey:$jobKey,label:$stageLabel,status:$status,required:$required,failureClass:(if ($failureClass | length) > 0 then $failureClass else null end)}'             > "${{ github.workspace }}/notionhub-stage-01.json"
 
       - name: 保存同步电影进度
         if: always() && steps.activation.outputs.enabled == 'true'
@@ -362,7 +370,7 @@ jobs:
       DOUBAN_CONFIG: ${{ secrets.DOUBAN_CONFIG }}
       NOTIONHUB_API_BASE: https://i.notionhub.app/v1
       NOTIONHUB_SERVICE: douban
-      NOTIONHUB_CONFIG_VERSION: '33'
+      NOTIONHUB_CONFIG_VERSION: '39'
       SYNC_POLICY_STATE_PATH: ${{ github.workspace }}/notionhub-state.json
       SYNC_POLICY_CONTINUATION_PATH: ${{ github.workspace }}/notionhub-continuation-id
       SYNC_POLICY_REPORT_PATH: ${{ github.workspace }}/notionhub-service-report.json
@@ -371,10 +379,75 @@ jobs:
       - name: 恢复上一阶段进度
         id: restore
         if: needs.movie.outputs.enabled == 'true' && needs.movie.result == 'success'
-        uses: actions/download-artifact@v4
-        with:
-          name: notionhub-douban-01-movie-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ github.workspace }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ARTIFACT_SPECS=(
+            "required|notionhub-douban-01-movie-${{ github.run_id }}-${{ github.run_attempt }}|notionhub-state.json|notionhub-continuation-id|notionhub-run-meta.json|notionhub-stage-01.json"
+          )
+          ATTEMPT_DIR=""
+          cleanup_artifact_attempt() {
+            if [ -n "$ATTEMPT_DIR" ] && [ -d "$ATTEMPT_DIR" ]; then
+              rm -rf -- "$ATTEMPT_DIR"
+            fi
+          }
+          trap cleanup_artifact_attempt EXIT
+
+          for ATTEMPT in 1 2 3 4 5 6; do
+            cleanup_artifact_attempt
+            ATTEMPT_DIR=$(mktemp -d "$RUNNER_TEMP/notionhub-artifacts.XXXXXX")
+            DOWNLOAD_OK=true
+            for SPEC in "${ARTIFACT_SPECS[@]}"; do
+              SPEC_REQUIRED="${SPEC%%|*}"
+              SPEC_CONTENT="${SPEC#*|}"
+              ARTIFACT_NAME="${SPEC_CONTENT%%|*}"
+              EXPECTED_FILES="${SPEC_CONTENT#*|}"
+              ARTIFACT_DIR="$ATTEMPT_DIR/$ARTIFACT_NAME"
+              mkdir -p "$ARTIFACT_DIR"
+              ARTIFACT_OK=true
+              if ! gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "$ARTIFACT_NAME" --dir "$ARTIFACT_DIR"; then
+                ARTIFACT_OK=false
+              else
+                IFS='|' read -r -a EXPECTED_FILE_LIST <<< "$EXPECTED_FILES"
+                for EXPECTED_FILE in "${EXPECTED_FILE_LIST[@]}"; do
+                  if [ ! -f "$ARTIFACT_DIR/$EXPECTED_FILE" ]; then
+                    ARTIFACT_OK=false
+                    break
+                  fi
+                done
+              fi
+              if [ "$ARTIFACT_OK" != "true" ]; then
+                rm -rf -- "$ARTIFACT_DIR"
+                if [ "$SPEC_REQUIRED" = "required" ]; then
+                  echo "::warning title=同步进度暂不可用::必要阶段结果尚未完整可见，将自动重试。"
+                  DOWNLOAD_OK=false
+                  break
+                fi
+                echo "::notice title=辅助阶段结果暂不可用::本次汇总将忽略尚未可见的辅助阶段结果。"
+              fi
+            done
+            if [ "$DOWNLOAD_OK" = "true" ]; then
+              cp -R "$ATTEMPT_DIR"/*/. "${{ github.workspace }}"/
+              cleanup_artifact_attempt
+              ATTEMPT_DIR=""
+              exit 0
+            fi
+            if [ "$ATTEMPT" -lt 6 ]; then
+              case "$ATTEMPT" in
+                1) DELAY=2 ;;
+                2) DELAY=4 ;;
+                3) DELAY=8 ;;
+                4) DELAY=16 ;;
+                *) DELAY=30 ;;
+              esac
+              echo "::notice title=等待同步进度::GitHub 阶段结果暂不可见，${DELAY} 秒后进行第 $((ATTEMPT + 1)) 次尝试。"
+              sleep "$DELAY"
+            fi
+          done
+
+          echo "::error title=同步进度恢复失败::GitHub 阶段结果在 6 次尝试后仍不可用。"
+          exit 1
 
       - name: 检查同步图书配置
         id: job_config
@@ -384,8 +457,8 @@ jobs:
           PLAN=$(printf '%s' "$SERVICE_CONFIG" | jq -r '.DOUBAN_SYNC_PLAN // "lifetime"')
           JOB_ENABLED=true
           SKIP_REASON=""
-          SERVICE_OPTIONS=$(printf '%s' "$SERVICE_CONFIG" | jq -r '.DOUBAN_SERVICE_OPTIONS // "{}"')
-          if ! printf '%s' "$SERVICE_OPTIONS" | jq -e --arg key "book" 'try fromjson catch {} | (.enabledStreams // []) as $enabled | ($enabled | length == 0) or ($enabled | index($key) != null)' >/dev/null; then
+          SERVICE_OPTIONS=$(printf '%s' "$SERVICE_CONFIG" | jq -c '.DOUBAN_SERVICE_OPTIONS // {}')
+          if ! printf '%s' "$SERVICE_OPTIONS" | jq -e --arg key "book" '(if type == "string" then (try fromjson catch {}) elif type == "object" then . else {} end) | (.enabledStreams // []) as $enabled | ($enabled | length == 0) or ($enabled | index($key) != null)' >/dev/null; then
             JOB_ENABLED=false
             SKIP_REASON="未在同步内容中启用"
           fi
@@ -541,6 +614,7 @@ jobs:
           SERVICE_REQUIREMENTS=$(cd runner && python -m notionhub_runner requirements douban)
           if [ -f "$SERVICE_REQUIREMENTS" ]; then pip install --quiet --disable-pip-version-check -r "$SERVICE_REQUIREMENTS"; fi
 
+
       - name: 同步图书
         id: sync
         if: steps.job_config.outputs.enabled == 'true' && steps.install.outcome == 'success'
@@ -571,6 +645,9 @@ jobs:
             echo "NOTIONHUB_INITIAL_FULL_SYNC_FORCED=$INITIAL_FULL_SYNC_FORCED"
           } >> "$GITHUB_ENV"
           export NOTIONHUB_ACTION_PAYLOAD="$ACTION_PAYLOAD"
+          export NOTIONHUB_REQUESTED_SYNC_MODE="$REQUESTED_SYNC_MODE"
+          export NOTIONHUB_EFFECTIVE_SYNC_MODE="$EFFECTIVE_SYNC_MODE"
+          export NOTIONHUB_INITIAL_FULL_SYNC_FORCED="$INITIAL_FULL_SYNC_FORCED"
           if [ "$SYNC_PLAN" = "trial" ] && [ "$EFFECTIVE_SYNC_MODE" = "full" ]; then
             echo "::error title=免费体验不支持全量更新::请激活后再执行全量更新。"
             exit 1
@@ -598,7 +675,7 @@ jobs:
             STATUS=failure
           fi
           if [ ! -f "$SYNC_POLICY_STATE_PATH" ]; then printf '{}' > "$SYNC_POLICY_STATE_PATH"; fi
-          jq -cn             --arg jobKey "book"             --arg label "同步图书"             --arg status "$STATUS"             --arg failureClass "${NOTIONHUB_FAILURE_CLASS:-}"             --argjson stageIndex 2             --argjson required true             '{stageIndex:$stageIndex,jobKey:$jobKey,label:$label,status:$status,required:$required,failureClass:(if ($failureClass | length) > 0 then $failureClass else null end)}'             > "${{ github.workspace }}/notionhub-stage-02.json"
+          jq -cn             --arg jobKey "book"             --arg stageLabel "同步图书"             --arg status "$STATUS"             --arg failureClass "${NOTIONHUB_FAILURE_CLASS:-}"             --argjson stageIndex 2             --argjson required true             '{stageIndex:$stageIndex,jobKey:$jobKey,label:$stageLabel,status:$status,required:$required,failureClass:(if ($failureClass | length) > 0 then $failureClass else null end)}'             > "${{ github.workspace }}/notionhub-stage-02.json"
 
       - name: 保存同步图书进度
         if: always() && needs.movie.outputs.enabled == 'true' && needs.movie.result == 'success'
@@ -628,7 +705,7 @@ jobs:
       DOUBAN_CONFIG: ${{ secrets.DOUBAN_CONFIG }}
       NOTIONHUB_API_BASE: https://i.notionhub.app/v1
       NOTIONHUB_SERVICE: douban
-      NOTIONHUB_CONFIG_VERSION: '33'
+      NOTIONHUB_CONFIG_VERSION: '39'
       SYNC_POLICY_STATE_PATH: ${{ github.workspace }}/notionhub-state.json
       SYNC_POLICY_CONTINUATION_PATH: ${{ github.workspace }}/notionhub-continuation-id
       SYNC_POLICY_REPORT_PATH: ${{ github.workspace }}/notionhub-service-report.json
@@ -637,10 +714,75 @@ jobs:
       - name: 恢复上一阶段进度
         id: restore
         if: needs.movie.outputs.enabled == 'true' && needs.book.result == 'success'
-        uses: actions/download-artifact@v4
-        with:
-          name: notionhub-douban-02-book-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ github.workspace }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ARTIFACT_SPECS=(
+            "required|notionhub-douban-02-book-${{ github.run_id }}-${{ github.run_attempt }}|notionhub-state.json|notionhub-continuation-id|notionhub-run-meta.json|notionhub-stage-02.json"
+          )
+          ATTEMPT_DIR=""
+          cleanup_artifact_attempt() {
+            if [ -n "$ATTEMPT_DIR" ] && [ -d "$ATTEMPT_DIR" ]; then
+              rm -rf -- "$ATTEMPT_DIR"
+            fi
+          }
+          trap cleanup_artifact_attempt EXIT
+
+          for ATTEMPT in 1 2 3 4 5 6; do
+            cleanup_artifact_attempt
+            ATTEMPT_DIR=$(mktemp -d "$RUNNER_TEMP/notionhub-artifacts.XXXXXX")
+            DOWNLOAD_OK=true
+            for SPEC in "${ARTIFACT_SPECS[@]}"; do
+              SPEC_REQUIRED="${SPEC%%|*}"
+              SPEC_CONTENT="${SPEC#*|}"
+              ARTIFACT_NAME="${SPEC_CONTENT%%|*}"
+              EXPECTED_FILES="${SPEC_CONTENT#*|}"
+              ARTIFACT_DIR="$ATTEMPT_DIR/$ARTIFACT_NAME"
+              mkdir -p "$ARTIFACT_DIR"
+              ARTIFACT_OK=true
+              if ! gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "$ARTIFACT_NAME" --dir "$ARTIFACT_DIR"; then
+                ARTIFACT_OK=false
+              else
+                IFS='|' read -r -a EXPECTED_FILE_LIST <<< "$EXPECTED_FILES"
+                for EXPECTED_FILE in "${EXPECTED_FILE_LIST[@]}"; do
+                  if [ ! -f "$ARTIFACT_DIR/$EXPECTED_FILE" ]; then
+                    ARTIFACT_OK=false
+                    break
+                  fi
+                done
+              fi
+              if [ "$ARTIFACT_OK" != "true" ]; then
+                rm -rf -- "$ARTIFACT_DIR"
+                if [ "$SPEC_REQUIRED" = "required" ]; then
+                  echo "::warning title=同步进度暂不可用::必要阶段结果尚未完整可见，将自动重试。"
+                  DOWNLOAD_OK=false
+                  break
+                fi
+                echo "::notice title=辅助阶段结果暂不可用::本次汇总将忽略尚未可见的辅助阶段结果。"
+              fi
+            done
+            if [ "$DOWNLOAD_OK" = "true" ]; then
+              cp -R "$ATTEMPT_DIR"/*/. "${{ github.workspace }}"/
+              cleanup_artifact_attempt
+              ATTEMPT_DIR=""
+              exit 0
+            fi
+            if [ "$ATTEMPT" -lt 6 ]; then
+              case "$ATTEMPT" in
+                1) DELAY=2 ;;
+                2) DELAY=4 ;;
+                3) DELAY=8 ;;
+                4) DELAY=16 ;;
+                *) DELAY=30 ;;
+              esac
+              echo "::notice title=等待同步进度::GitHub 阶段结果暂不可见，${DELAY} 秒后进行第 $((ATTEMPT + 1)) 次尝试。"
+              sleep "$DELAY"
+            fi
+          done
+
+          echo "::error title=同步进度恢复失败::GitHub 阶段结果在 6 次尝试后仍不可用。"
+          exit 1
 
       - name: 检查同步音乐配置
         id: job_config
@@ -650,8 +792,8 @@ jobs:
           PLAN=$(printf '%s' "$SERVICE_CONFIG" | jq -r '.DOUBAN_SYNC_PLAN // "lifetime"')
           JOB_ENABLED=true
           SKIP_REASON=""
-          SERVICE_OPTIONS=$(printf '%s' "$SERVICE_CONFIG" | jq -r '.DOUBAN_SERVICE_OPTIONS // "{}"')
-          if ! printf '%s' "$SERVICE_OPTIONS" | jq -e --arg key "music" 'try fromjson catch {} | (.enabledStreams // []) as $enabled | ($enabled | length == 0) or ($enabled | index($key) != null)' >/dev/null; then
+          SERVICE_OPTIONS=$(printf '%s' "$SERVICE_CONFIG" | jq -c '.DOUBAN_SERVICE_OPTIONS // {}')
+          if ! printf '%s' "$SERVICE_OPTIONS" | jq -e --arg key "music" '(if type == "string" then (try fromjson catch {}) elif type == "object" then . else {} end) | (.enabledStreams // []) as $enabled | ($enabled | length == 0) or ($enabled | index($key) != null)' >/dev/null; then
             JOB_ENABLED=false
             SKIP_REASON="未在同步内容中启用"
           fi
@@ -807,6 +949,7 @@ jobs:
           SERVICE_REQUIREMENTS=$(cd runner && python -m notionhub_runner requirements douban)
           if [ -f "$SERVICE_REQUIREMENTS" ]; then pip install --quiet --disable-pip-version-check -r "$SERVICE_REQUIREMENTS"; fi
 
+
       - name: 同步音乐
         id: sync
         if: steps.job_config.outputs.enabled == 'true' && steps.install.outcome == 'success'
@@ -837,6 +980,9 @@ jobs:
             echo "NOTIONHUB_INITIAL_FULL_SYNC_FORCED=$INITIAL_FULL_SYNC_FORCED"
           } >> "$GITHUB_ENV"
           export NOTIONHUB_ACTION_PAYLOAD="$ACTION_PAYLOAD"
+          export NOTIONHUB_REQUESTED_SYNC_MODE="$REQUESTED_SYNC_MODE"
+          export NOTIONHUB_EFFECTIVE_SYNC_MODE="$EFFECTIVE_SYNC_MODE"
+          export NOTIONHUB_INITIAL_FULL_SYNC_FORCED="$INITIAL_FULL_SYNC_FORCED"
           if [ "$SYNC_PLAN" = "trial" ] && [ "$EFFECTIVE_SYNC_MODE" = "full" ]; then
             echo "::error title=免费体验不支持全量更新::请激活后再执行全量更新。"
             exit 1
@@ -864,7 +1010,7 @@ jobs:
             STATUS=failure
           fi
           if [ ! -f "$SYNC_POLICY_STATE_PATH" ]; then printf '{}' > "$SYNC_POLICY_STATE_PATH"; fi
-          jq -cn             --arg jobKey "music"             --arg label "同步音乐"             --arg status "$STATUS"             --arg failureClass "${NOTIONHUB_FAILURE_CLASS:-}"             --argjson stageIndex 3             --argjson required true             '{stageIndex:$stageIndex,jobKey:$jobKey,label:$label,status:$status,required:$required,failureClass:(if ($failureClass | length) > 0 then $failureClass else null end)}'             > "${{ github.workspace }}/notionhub-stage-03.json"
+          jq -cn             --arg jobKey "music"             --arg stageLabel "同步音乐"             --arg status "$STATUS"             --arg failureClass "${NOTIONHUB_FAILURE_CLASS:-}"             --argjson stageIndex 3             --argjson required true             '{stageIndex:$stageIndex,jobKey:$jobKey,label:$stageLabel,status:$status,required:$required,failureClass:(if ($failureClass | length) > 0 then $failureClass else null end)}'             > "${{ github.workspace }}/notionhub-stage-03.json"
 
       - name: 保存同步音乐进度
         if: always() && needs.movie.outputs.enabled == 'true' && needs.book.result == 'success'
@@ -894,7 +1040,7 @@ jobs:
       DOUBAN_CONFIG: ${{ secrets.DOUBAN_CONFIG }}
       NOTIONHUB_API_BASE: https://i.notionhub.app/v1
       NOTIONHUB_SERVICE: douban
-      NOTIONHUB_CONFIG_VERSION: '33'
+      NOTIONHUB_CONFIG_VERSION: '39'
       SYNC_POLICY_STATE_PATH: ${{ github.workspace }}/notionhub-state.json
       SYNC_POLICY_CONTINUATION_PATH: ${{ github.workspace }}/notionhub-continuation-id
       SYNC_POLICY_REPORT_PATH: ${{ github.workspace }}/notionhub-service-report.json
@@ -903,10 +1049,75 @@ jobs:
       - name: 恢复上一阶段进度
         id: restore
         if: needs.movie.outputs.enabled == 'true' && needs.music.result == 'success'
-        uses: actions/download-artifact@v4
-        with:
-          name: notionhub-douban-03-music-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ github.workspace }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ARTIFACT_SPECS=(
+            "required|notionhub-douban-03-music-${{ github.run_id }}-${{ github.run_attempt }}|notionhub-state.json|notionhub-continuation-id|notionhub-run-meta.json|notionhub-stage-03.json"
+          )
+          ATTEMPT_DIR=""
+          cleanup_artifact_attempt() {
+            if [ -n "$ATTEMPT_DIR" ] && [ -d "$ATTEMPT_DIR" ]; then
+              rm -rf -- "$ATTEMPT_DIR"
+            fi
+          }
+          trap cleanup_artifact_attempt EXIT
+
+          for ATTEMPT in 1 2 3 4 5 6; do
+            cleanup_artifact_attempt
+            ATTEMPT_DIR=$(mktemp -d "$RUNNER_TEMP/notionhub-artifacts.XXXXXX")
+            DOWNLOAD_OK=true
+            for SPEC in "${ARTIFACT_SPECS[@]}"; do
+              SPEC_REQUIRED="${SPEC%%|*}"
+              SPEC_CONTENT="${SPEC#*|}"
+              ARTIFACT_NAME="${SPEC_CONTENT%%|*}"
+              EXPECTED_FILES="${SPEC_CONTENT#*|}"
+              ARTIFACT_DIR="$ATTEMPT_DIR/$ARTIFACT_NAME"
+              mkdir -p "$ARTIFACT_DIR"
+              ARTIFACT_OK=true
+              if ! gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "$ARTIFACT_NAME" --dir "$ARTIFACT_DIR"; then
+                ARTIFACT_OK=false
+              else
+                IFS='|' read -r -a EXPECTED_FILE_LIST <<< "$EXPECTED_FILES"
+                for EXPECTED_FILE in "${EXPECTED_FILE_LIST[@]}"; do
+                  if [ ! -f "$ARTIFACT_DIR/$EXPECTED_FILE" ]; then
+                    ARTIFACT_OK=false
+                    break
+                  fi
+                done
+              fi
+              if [ "$ARTIFACT_OK" != "true" ]; then
+                rm -rf -- "$ARTIFACT_DIR"
+                if [ "$SPEC_REQUIRED" = "required" ]; then
+                  echo "::warning title=同步进度暂不可用::必要阶段结果尚未完整可见，将自动重试。"
+                  DOWNLOAD_OK=false
+                  break
+                fi
+                echo "::notice title=辅助阶段结果暂不可用::本次汇总将忽略尚未可见的辅助阶段结果。"
+              fi
+            done
+            if [ "$DOWNLOAD_OK" = "true" ]; then
+              cp -R "$ATTEMPT_DIR"/*/. "${{ github.workspace }}"/
+              cleanup_artifact_attempt
+              ATTEMPT_DIR=""
+              exit 0
+            fi
+            if [ "$ATTEMPT" -lt 6 ]; then
+              case "$ATTEMPT" in
+                1) DELAY=2 ;;
+                2) DELAY=4 ;;
+                3) DELAY=8 ;;
+                4) DELAY=16 ;;
+                *) DELAY=30 ;;
+              esac
+              echo "::notice title=等待同步进度::GitHub 阶段结果暂不可见，${DELAY} 秒后进行第 $((ATTEMPT + 1)) 次尝试。"
+              sleep "$DELAY"
+            fi
+          done
+
+          echo "::error title=同步进度恢复失败::GitHub 阶段结果在 6 次尝试后仍不可用。"
+          exit 1
 
       - name: 检查同步游戏配置
         id: job_config
@@ -916,8 +1127,8 @@ jobs:
           PLAN=$(printf '%s' "$SERVICE_CONFIG" | jq -r '.DOUBAN_SYNC_PLAN // "lifetime"')
           JOB_ENABLED=true
           SKIP_REASON=""
-          SERVICE_OPTIONS=$(printf '%s' "$SERVICE_CONFIG" | jq -r '.DOUBAN_SERVICE_OPTIONS // "{}"')
-          if ! printf '%s' "$SERVICE_OPTIONS" | jq -e --arg key "game" 'try fromjson catch {} | (.enabledStreams // []) as $enabled | ($enabled | length == 0) or ($enabled | index($key) != null)' >/dev/null; then
+          SERVICE_OPTIONS=$(printf '%s' "$SERVICE_CONFIG" | jq -c '.DOUBAN_SERVICE_OPTIONS // {}')
+          if ! printf '%s' "$SERVICE_OPTIONS" | jq -e --arg key "game" '(if type == "string" then (try fromjson catch {}) elif type == "object" then . else {} end) | (.enabledStreams // []) as $enabled | ($enabled | length == 0) or ($enabled | index($key) != null)' >/dev/null; then
             JOB_ENABLED=false
             SKIP_REASON="未在同步内容中启用"
           fi
@@ -1073,6 +1284,7 @@ jobs:
           SERVICE_REQUIREMENTS=$(cd runner && python -m notionhub_runner requirements douban)
           if [ -f "$SERVICE_REQUIREMENTS" ]; then pip install --quiet --disable-pip-version-check -r "$SERVICE_REQUIREMENTS"; fi
 
+
       - name: 同步游戏
         id: sync
         if: steps.job_config.outputs.enabled == 'true' && steps.install.outcome == 'success'
@@ -1103,6 +1315,9 @@ jobs:
             echo "NOTIONHUB_INITIAL_FULL_SYNC_FORCED=$INITIAL_FULL_SYNC_FORCED"
           } >> "$GITHUB_ENV"
           export NOTIONHUB_ACTION_PAYLOAD="$ACTION_PAYLOAD"
+          export NOTIONHUB_REQUESTED_SYNC_MODE="$REQUESTED_SYNC_MODE"
+          export NOTIONHUB_EFFECTIVE_SYNC_MODE="$EFFECTIVE_SYNC_MODE"
+          export NOTIONHUB_INITIAL_FULL_SYNC_FORCED="$INITIAL_FULL_SYNC_FORCED"
           if [ "$SYNC_PLAN" = "trial" ] && [ "$EFFECTIVE_SYNC_MODE" = "full" ]; then
             echo "::error title=免费体验不支持全量更新::请激活后再执行全量更新。"
             exit 1
@@ -1130,7 +1345,7 @@ jobs:
             STATUS=failure
           fi
           if [ ! -f "$SYNC_POLICY_STATE_PATH" ]; then printf '{}' > "$SYNC_POLICY_STATE_PATH"; fi
-          jq -cn             --arg jobKey "game"             --arg label "同步游戏"             --arg status "$STATUS"             --arg failureClass "${NOTIONHUB_FAILURE_CLASS:-}"             --argjson stageIndex 4             --argjson required true             '{stageIndex:$stageIndex,jobKey:$jobKey,label:$label,status:$status,required:$required,failureClass:(if ($failureClass | length) > 0 then $failureClass else null end)}'             > "${{ github.workspace }}/notionhub-stage-04.json"
+          jq -cn             --arg jobKey "game"             --arg stageLabel "同步游戏"             --arg status "$STATUS"             --arg failureClass "${NOTIONHUB_FAILURE_CLASS:-}"             --argjson stageIndex 4             --argjson required true             '{stageIndex:$stageIndex,jobKey:$jobKey,label:$stageLabel,status:$status,required:$required,failureClass:(if ($failureClass | length) > 0 then $failureClass else null end)}'             > "${{ github.workspace }}/notionhub-stage-04.json"
 
       - name: 保存同步游戏进度
         if: always() && needs.movie.outputs.enabled == 'true' && needs.music.result == 'success'
@@ -1160,7 +1375,7 @@ jobs:
       DOUBAN_CONFIG: ${{ secrets.DOUBAN_CONFIG }}
       NOTIONHUB_API_BASE: https://i.notionhub.app/v1
       NOTIONHUB_SERVICE: douban
-      NOTIONHUB_CONFIG_VERSION: '33'
+      NOTIONHUB_CONFIG_VERSION: '39'
       SYNC_POLICY_STATE_PATH: ${{ github.workspace }}/notionhub-state.json
       SYNC_POLICY_CONTINUATION_PATH: ${{ github.workspace }}/notionhub-continuation-id
       SYNC_POLICY_REPORT_PATH: ${{ github.workspace }}/notionhub-service-report.json
@@ -1169,10 +1384,75 @@ jobs:
       - name: 恢复上一阶段进度
         id: restore
         if: needs.movie.outputs.enabled == 'true' && needs.game.result == 'success'
-        uses: actions/download-artifact@v4
-        with:
-          name: notionhub-douban-04-game-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ github.workspace }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ARTIFACT_SPECS=(
+            "required|notionhub-douban-04-game-${{ github.run_id }}-${{ github.run_attempt }}|notionhub-state.json|notionhub-continuation-id|notionhub-run-meta.json|notionhub-stage-04.json"
+          )
+          ATTEMPT_DIR=""
+          cleanup_artifact_attempt() {
+            if [ -n "$ATTEMPT_DIR" ] && [ -d "$ATTEMPT_DIR" ]; then
+              rm -rf -- "$ATTEMPT_DIR"
+            fi
+          }
+          trap cleanup_artifact_attempt EXIT
+
+          for ATTEMPT in 1 2 3 4 5 6; do
+            cleanup_artifact_attempt
+            ATTEMPT_DIR=$(mktemp -d "$RUNNER_TEMP/notionhub-artifacts.XXXXXX")
+            DOWNLOAD_OK=true
+            for SPEC in "${ARTIFACT_SPECS[@]}"; do
+              SPEC_REQUIRED="${SPEC%%|*}"
+              SPEC_CONTENT="${SPEC#*|}"
+              ARTIFACT_NAME="${SPEC_CONTENT%%|*}"
+              EXPECTED_FILES="${SPEC_CONTENT#*|}"
+              ARTIFACT_DIR="$ATTEMPT_DIR/$ARTIFACT_NAME"
+              mkdir -p "$ARTIFACT_DIR"
+              ARTIFACT_OK=true
+              if ! gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "$ARTIFACT_NAME" --dir "$ARTIFACT_DIR"; then
+                ARTIFACT_OK=false
+              else
+                IFS='|' read -r -a EXPECTED_FILE_LIST <<< "$EXPECTED_FILES"
+                for EXPECTED_FILE in "${EXPECTED_FILE_LIST[@]}"; do
+                  if [ ! -f "$ARTIFACT_DIR/$EXPECTED_FILE" ]; then
+                    ARTIFACT_OK=false
+                    break
+                  fi
+                done
+              fi
+              if [ "$ARTIFACT_OK" != "true" ]; then
+                rm -rf -- "$ARTIFACT_DIR"
+                if [ "$SPEC_REQUIRED" = "required" ]; then
+                  echo "::warning title=同步进度暂不可用::必要阶段结果尚未完整可见，将自动重试。"
+                  DOWNLOAD_OK=false
+                  break
+                fi
+                echo "::notice title=辅助阶段结果暂不可用::本次汇总将忽略尚未可见的辅助阶段结果。"
+              fi
+            done
+            if [ "$DOWNLOAD_OK" = "true" ]; then
+              cp -R "$ATTEMPT_DIR"/*/. "${{ github.workspace }}"/
+              cleanup_artifact_attempt
+              ATTEMPT_DIR=""
+              exit 0
+            fi
+            if [ "$ATTEMPT" -lt 6 ]; then
+              case "$ATTEMPT" in
+                1) DELAY=2 ;;
+                2) DELAY=4 ;;
+                3) DELAY=8 ;;
+                4) DELAY=16 ;;
+                *) DELAY=30 ;;
+              esac
+              echo "::notice title=等待同步进度::GitHub 阶段结果暂不可见，${DELAY} 秒后进行第 $((ATTEMPT + 1)) 次尝试。"
+              sleep "$DELAY"
+            fi
+          done
+
+          echo "::error title=同步进度恢复失败::GitHub 阶段结果在 6 次尝试后仍不可用。"
+          exit 1
 
       - name: 检查同步播客配置
         id: job_config
@@ -1182,8 +1462,8 @@ jobs:
           PLAN=$(printf '%s' "$SERVICE_CONFIG" | jq -r '.DOUBAN_SYNC_PLAN // "lifetime"')
           JOB_ENABLED=true
           SKIP_REASON=""
-          SERVICE_OPTIONS=$(printf '%s' "$SERVICE_CONFIG" | jq -r '.DOUBAN_SERVICE_OPTIONS // "{}"')
-          if ! printf '%s' "$SERVICE_OPTIONS" | jq -e --arg key "podcast" 'try fromjson catch {} | (.enabledStreams // []) as $enabled | ($enabled | length == 0) or ($enabled | index($key) != null)' >/dev/null; then
+          SERVICE_OPTIONS=$(printf '%s' "$SERVICE_CONFIG" | jq -c '.DOUBAN_SERVICE_OPTIONS // {}')
+          if ! printf '%s' "$SERVICE_OPTIONS" | jq -e --arg key "podcast" '(if type == "string" then (try fromjson catch {}) elif type == "object" then . else {} end) | (.enabledStreams // []) as $enabled | ($enabled | length == 0) or ($enabled | index($key) != null)' >/dev/null; then
             JOB_ENABLED=false
             SKIP_REASON="未在同步内容中启用"
           fi
@@ -1339,6 +1619,7 @@ jobs:
           SERVICE_REQUIREMENTS=$(cd runner && python -m notionhub_runner requirements douban)
           if [ -f "$SERVICE_REQUIREMENTS" ]; then pip install --quiet --disable-pip-version-check -r "$SERVICE_REQUIREMENTS"; fi
 
+
       - name: 同步播客
         id: sync
         if: steps.job_config.outputs.enabled == 'true' && steps.install.outcome == 'success'
@@ -1369,6 +1650,9 @@ jobs:
             echo "NOTIONHUB_INITIAL_FULL_SYNC_FORCED=$INITIAL_FULL_SYNC_FORCED"
           } >> "$GITHUB_ENV"
           export NOTIONHUB_ACTION_PAYLOAD="$ACTION_PAYLOAD"
+          export NOTIONHUB_REQUESTED_SYNC_MODE="$REQUESTED_SYNC_MODE"
+          export NOTIONHUB_EFFECTIVE_SYNC_MODE="$EFFECTIVE_SYNC_MODE"
+          export NOTIONHUB_INITIAL_FULL_SYNC_FORCED="$INITIAL_FULL_SYNC_FORCED"
           if [ "$SYNC_PLAN" = "trial" ] && [ "$EFFECTIVE_SYNC_MODE" = "full" ]; then
             echo "::error title=免费体验不支持全量更新::请激活后再执行全量更新。"
             exit 1
@@ -1396,7 +1680,7 @@ jobs:
             STATUS=failure
           fi
           if [ ! -f "$SYNC_POLICY_STATE_PATH" ]; then printf '{}' > "$SYNC_POLICY_STATE_PATH"; fi
-          jq -cn             --arg jobKey "podcast"             --arg label "同步播客"             --arg status "$STATUS"             --arg failureClass "${NOTIONHUB_FAILURE_CLASS:-}"             --argjson stageIndex 5             --argjson required true             '{stageIndex:$stageIndex,jobKey:$jobKey,label:$label,status:$status,required:$required,failureClass:(if ($failureClass | length) > 0 then $failureClass else null end)}'             > "${{ github.workspace }}/notionhub-stage-05.json"
+          jq -cn             --arg jobKey "podcast"             --arg stageLabel "同步播客"             --arg status "$STATUS"             --arg failureClass "${NOTIONHUB_FAILURE_CLASS:-}"             --argjson stageIndex 5             --argjson required true             '{stageIndex:$stageIndex,jobKey:$jobKey,label:$stageLabel,status:$status,required:$required,failureClass:(if ($failureClass | length) > 0 then $failureClass else null end)}'             > "${{ github.workspace }}/notionhub-stage-05.json"
 
       - name: 保存同步播客进度
         if: always() && needs.movie.outputs.enabled == 'true' && needs.game.result == 'success'
@@ -1426,7 +1710,7 @@ jobs:
       DOUBAN_CONFIG: ${{ secrets.DOUBAN_CONFIG }}
       NOTIONHUB_API_BASE: https://i.notionhub.app/v1
       NOTIONHUB_SERVICE: douban
-      NOTIONHUB_CONFIG_VERSION: '33'
+      NOTIONHUB_CONFIG_VERSION: '39'
       SYNC_POLICY_STATE_PATH: ${{ github.workspace }}/notionhub-state.json
       SYNC_POLICY_CONTINUATION_PATH: ${{ github.workspace }}/notionhub-continuation-id
       SYNC_POLICY_REPORT_PATH: ${{ github.workspace }}/notionhub-service-report.json
@@ -1435,10 +1719,75 @@ jobs:
       - name: 恢复上一阶段进度
         id: restore
         if: needs.movie.outputs.enabled == 'true' && needs.podcast.result == 'success'
-        uses: actions/download-artifact@v4
-        with:
-          name: notionhub-douban-05-podcast-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ github.workspace }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ARTIFACT_SPECS=(
+            "required|notionhub-douban-05-podcast-${{ github.run_id }}-${{ github.run_attempt }}|notionhub-state.json|notionhub-continuation-id|notionhub-run-meta.json|notionhub-stage-05.json"
+          )
+          ATTEMPT_DIR=""
+          cleanup_artifact_attempt() {
+            if [ -n "$ATTEMPT_DIR" ] && [ -d "$ATTEMPT_DIR" ]; then
+              rm -rf -- "$ATTEMPT_DIR"
+            fi
+          }
+          trap cleanup_artifact_attempt EXIT
+
+          for ATTEMPT in 1 2 3 4 5 6; do
+            cleanup_artifact_attempt
+            ATTEMPT_DIR=$(mktemp -d "$RUNNER_TEMP/notionhub-artifacts.XXXXXX")
+            DOWNLOAD_OK=true
+            for SPEC in "${ARTIFACT_SPECS[@]}"; do
+              SPEC_REQUIRED="${SPEC%%|*}"
+              SPEC_CONTENT="${SPEC#*|}"
+              ARTIFACT_NAME="${SPEC_CONTENT%%|*}"
+              EXPECTED_FILES="${SPEC_CONTENT#*|}"
+              ARTIFACT_DIR="$ATTEMPT_DIR/$ARTIFACT_NAME"
+              mkdir -p "$ARTIFACT_DIR"
+              ARTIFACT_OK=true
+              if ! gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "$ARTIFACT_NAME" --dir "$ARTIFACT_DIR"; then
+                ARTIFACT_OK=false
+              else
+                IFS='|' read -r -a EXPECTED_FILE_LIST <<< "$EXPECTED_FILES"
+                for EXPECTED_FILE in "${EXPECTED_FILE_LIST[@]}"; do
+                  if [ ! -f "$ARTIFACT_DIR/$EXPECTED_FILE" ]; then
+                    ARTIFACT_OK=false
+                    break
+                  fi
+                done
+              fi
+              if [ "$ARTIFACT_OK" != "true" ]; then
+                rm -rf -- "$ARTIFACT_DIR"
+                if [ "$SPEC_REQUIRED" = "required" ]; then
+                  echo "::warning title=同步进度暂不可用::必要阶段结果尚未完整可见，将自动重试。"
+                  DOWNLOAD_OK=false
+                  break
+                fi
+                echo "::notice title=辅助阶段结果暂不可用::本次汇总将忽略尚未可见的辅助阶段结果。"
+              fi
+            done
+            if [ "$DOWNLOAD_OK" = "true" ]; then
+              cp -R "$ATTEMPT_DIR"/*/. "${{ github.workspace }}"/
+              cleanup_artifact_attempt
+              ATTEMPT_DIR=""
+              exit 0
+            fi
+            if [ "$ATTEMPT" -lt 6 ]; then
+              case "$ATTEMPT" in
+                1) DELAY=2 ;;
+                2) DELAY=4 ;;
+                3) DELAY=8 ;;
+                4) DELAY=16 ;;
+                *) DELAY=30 ;;
+              esac
+              echo "::notice title=等待同步进度::GitHub 阶段结果暂不可见，${DELAY} 秒后进行第 $((ATTEMPT + 1)) 次尝试。"
+              sleep "$DELAY"
+            fi
+          done
+
+          echo "::error title=同步进度恢复失败::GitHub 阶段结果在 6 次尝试后仍不可用。"
+          exit 1
 
       - name: 检查同步舞台剧配置
         id: job_config
@@ -1448,8 +1797,8 @@ jobs:
           PLAN=$(printf '%s' "$SERVICE_CONFIG" | jq -r '.DOUBAN_SYNC_PLAN // "lifetime"')
           JOB_ENABLED=true
           SKIP_REASON=""
-          SERVICE_OPTIONS=$(printf '%s' "$SERVICE_CONFIG" | jq -r '.DOUBAN_SERVICE_OPTIONS // "{}"')
-          if ! printf '%s' "$SERVICE_OPTIONS" | jq -e --arg key "drama" 'try fromjson catch {} | (.enabledStreams // []) as $enabled | ($enabled | length == 0) or ($enabled | index($key) != null)' >/dev/null; then
+          SERVICE_OPTIONS=$(printf '%s' "$SERVICE_CONFIG" | jq -c '.DOUBAN_SERVICE_OPTIONS // {}')
+          if ! printf '%s' "$SERVICE_OPTIONS" | jq -e --arg key "drama" '(if type == "string" then (try fromjson catch {}) elif type == "object" then . else {} end) | (.enabledStreams // []) as $enabled | ($enabled | length == 0) or ($enabled | index($key) != null)' >/dev/null; then
             JOB_ENABLED=false
             SKIP_REASON="未在同步内容中启用"
           fi
@@ -1605,6 +1954,7 @@ jobs:
           SERVICE_REQUIREMENTS=$(cd runner && python -m notionhub_runner requirements douban)
           if [ -f "$SERVICE_REQUIREMENTS" ]; then pip install --quiet --disable-pip-version-check -r "$SERVICE_REQUIREMENTS"; fi
 
+
       - name: 同步舞台剧
         id: sync
         if: steps.job_config.outputs.enabled == 'true' && steps.install.outcome == 'success'
@@ -1635,6 +1985,9 @@ jobs:
             echo "NOTIONHUB_INITIAL_FULL_SYNC_FORCED=$INITIAL_FULL_SYNC_FORCED"
           } >> "$GITHUB_ENV"
           export NOTIONHUB_ACTION_PAYLOAD="$ACTION_PAYLOAD"
+          export NOTIONHUB_REQUESTED_SYNC_MODE="$REQUESTED_SYNC_MODE"
+          export NOTIONHUB_EFFECTIVE_SYNC_MODE="$EFFECTIVE_SYNC_MODE"
+          export NOTIONHUB_INITIAL_FULL_SYNC_FORCED="$INITIAL_FULL_SYNC_FORCED"
           if [ "$SYNC_PLAN" = "trial" ] && [ "$EFFECTIVE_SYNC_MODE" = "full" ]; then
             echo "::error title=免费体验不支持全量更新::请激活后再执行全量更新。"
             exit 1
@@ -1662,7 +2015,7 @@ jobs:
             STATUS=failure
           fi
           if [ ! -f "$SYNC_POLICY_STATE_PATH" ]; then printf '{}' > "$SYNC_POLICY_STATE_PATH"; fi
-          jq -cn             --arg jobKey "drama"             --arg label "同步舞台剧"             --arg status "$STATUS"             --arg failureClass "${NOTIONHUB_FAILURE_CLASS:-}"             --argjson stageIndex 6             --argjson required true             '{stageIndex:$stageIndex,jobKey:$jobKey,label:$label,status:$status,required:$required,failureClass:(if ($failureClass | length) > 0 then $failureClass else null end)}'             > "${{ github.workspace }}/notionhub-stage-06.json"
+          jq -cn             --arg jobKey "drama"             --arg stageLabel "同步舞台剧"             --arg status "$STATUS"             --arg failureClass "${NOTIONHUB_FAILURE_CLASS:-}"             --argjson stageIndex 6             --argjson required true             '{stageIndex:$stageIndex,jobKey:$jobKey,label:$stageLabel,status:$status,required:$required,failureClass:(if ($failureClass | length) > 0 then $failureClass else null end)}'             > "${{ github.workspace }}/notionhub-stage-06.json"
 
       - name: 保存同步舞台剧进度
         if: always() && needs.movie.outputs.enabled == 'true' && needs.podcast.result == 'success'
@@ -1680,10 +2033,81 @@ jobs:
       - name: 下载全部阶段结果
         if: always() && needs.movie.outputs.enabled == 'true'
         continue-on-error: true
-        uses: actions/download-artifact@v4
-        with:
-          pattern: notionhub-douban-*-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ github.workspace }}/notionhub-artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ARTIFACT_SPECS=(
+            "required|notionhub-douban-01-movie-${{ github.run_id }}-${{ github.run_attempt }}|notionhub-stage-01.json"
+            "required|notionhub-douban-02-book-${{ github.run_id }}-${{ github.run_attempt }}|notionhub-stage-02.json"
+            "required|notionhub-douban-03-music-${{ github.run_id }}-${{ github.run_attempt }}|notionhub-stage-03.json"
+            "required|notionhub-douban-04-game-${{ github.run_id }}-${{ github.run_attempt }}|notionhub-stage-04.json"
+            "required|notionhub-douban-05-podcast-${{ github.run_id }}-${{ github.run_attempt }}|notionhub-stage-05.json"
+            "required|notionhub-douban-06-drama-${{ github.run_id }}-${{ github.run_attempt }}|notionhub-stage-06.json"
+          )
+          ATTEMPT_DIR=""
+          cleanup_artifact_attempt() {
+            if [ -n "$ATTEMPT_DIR" ] && [ -d "$ATTEMPT_DIR" ]; then
+              rm -rf -- "$ATTEMPT_DIR"
+            fi
+          }
+          trap cleanup_artifact_attempt EXIT
+
+          for ATTEMPT in 1 2 3 4 5 6; do
+            cleanup_artifact_attempt
+            ATTEMPT_DIR=$(mktemp -d "$RUNNER_TEMP/notionhub-artifacts.XXXXXX")
+            DOWNLOAD_OK=true
+            for SPEC in "${ARTIFACT_SPECS[@]}"; do
+              SPEC_REQUIRED="${SPEC%%|*}"
+              SPEC_CONTENT="${SPEC#*|}"
+              ARTIFACT_NAME="${SPEC_CONTENT%%|*}"
+              EXPECTED_FILES="${SPEC_CONTENT#*|}"
+              ARTIFACT_DIR="$ATTEMPT_DIR/$ARTIFACT_NAME"
+              mkdir -p "$ARTIFACT_DIR"
+              ARTIFACT_OK=true
+              if ! gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "$ARTIFACT_NAME" --dir "$ARTIFACT_DIR"; then
+                ARTIFACT_OK=false
+              else
+                IFS='|' read -r -a EXPECTED_FILE_LIST <<< "$EXPECTED_FILES"
+                for EXPECTED_FILE in "${EXPECTED_FILE_LIST[@]}"; do
+                  if [ ! -f "$ARTIFACT_DIR/$EXPECTED_FILE" ]; then
+                    ARTIFACT_OK=false
+                    break
+                  fi
+                done
+              fi
+              if [ "$ARTIFACT_OK" != "true" ]; then
+                rm -rf -- "$ARTIFACT_DIR"
+                if [ "$SPEC_REQUIRED" = "required" ]; then
+                  echo "::warning title=同步进度暂不可用::必要阶段结果尚未完整可见，将自动重试。"
+                  DOWNLOAD_OK=false
+                  break
+                fi
+                echo "::notice title=辅助阶段结果暂不可用::本次汇总将忽略尚未可见的辅助阶段结果。"
+              fi
+            done
+            if [ "$DOWNLOAD_OK" = "true" ]; then
+              mkdir -p "${{ github.workspace }}/notionhub-artifacts"
+              cp -R "$ATTEMPT_DIR"/. "${{ github.workspace }}/notionhub-artifacts"/
+              cleanup_artifact_attempt
+              ATTEMPT_DIR=""
+              exit 0
+            fi
+            if [ "$ATTEMPT" -lt 6 ]; then
+              case "$ATTEMPT" in
+                1) DELAY=2 ;;
+                2) DELAY=4 ;;
+                3) DELAY=8 ;;
+                4) DELAY=16 ;;
+                *) DELAY=30 ;;
+              esac
+              echo "::notice title=等待同步进度::GitHub 阶段结果暂不可见，${DELAY} 秒后进行第 $((ATTEMPT + 1)) 次尝试。"
+              sleep "$DELAY"
+            fi
+          done
+
+          echo "::error title=同步进度恢复失败::GitHub 阶段结果在 6 次尝试后仍不可用。"
+          exit 1
 
       - name: 汇总同步结果
         id: aggregate
